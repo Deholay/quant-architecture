@@ -51,7 +51,7 @@ public:
         const auto w = __atomic_load_n(&write_.value, __ATOMIC_RELAXED);
         const auto r = __atomic_load_n(&read_.value, __ATOMIC_ACQUIRE);
         if (w - r == Capacity) return false;
-        slots_[w & (Capacity - 1)] = message;
+        slots_[w & (Capacity - 1)] = message; // AND mask to ensure ring
         __atomic_store_n(&write_.value, w + 1, __ATOMIC_RELEASE);
         return true;
     }
@@ -61,7 +61,7 @@ public:
         const auto r = __atomic_load_n(&read_.value, __ATOMIC_RELAXED);
         const auto w = __atomic_load_n(&write_.value, __ATOMIC_ACQUIRE);
         if (r == w) return false;
-        output = slots_[r & (Capacity - 1)];
+        output = slots_[r & (Capacity - 1)]; // AND mask to ensure ring
         __atomic_store_n(&read_.value, r + 1, __ATOMIC_RELEASE);
         return true;
     }
