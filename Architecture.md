@@ -1,3 +1,18 @@
+# 本階段實作：IPC 基礎層
+
+目前已實作 Linux／C++20 的 SHM、SHM manager 與 SPSC，操作方式見 [README.md](README.md)。
+
+| 元件 | 程式碼 | 責任 |
+|---|---|---|
+| ShmRegion | `include/quant/ipc/shm_region.hpp`、`src/shm_region.cpp` | 建立、映射、解除映射及顯式 unlink |
+| ShmManager / ShmQueue | `include/quant/ipc/shm_manager.hpp` | 初始化與驗證 typed queue，持有本地映射 |
+| SpscRing | `include/quant/ipc/spsc_ring.hpp` | 共用 template；每個 SHM 各自持有索引與訊息陣列 |
+
+後續由 launcher 建立三個獨立 SHM，再讓 MD／ST／OMS 連接；manager 不參與逐筆傳輸。
+本階段尚未實作三大業務模組、MarketTick／OrderRequest／ExecutionReport、supervisor 或交易復原。
+SPSC 嚴格限定每條 queue 一個 producer thread 與一個 consumer thread。
+兩個索引各自占用獨立的 64-byte cache line；訊息陣列起點對齊 64 bytes。
+
 # 三大模組
 * Process 1: **MD** 行情接收模組 (Market Data Process)
 * Process 2: **ST** 策略模組 (Strategy Process)
@@ -45,24 +60,24 @@ subgraph MD_PROC ["Process 1: 行情接收模組 (MD Process)"]
     direction TB
     MD_Net["網路接收器(UDP / Kernel-Bypass)"]
     MD_Parser["行情解碼器<br/>(Packet Parser & Book Builder)"]
-    MD_Writer["MD 行情寫入端<br/>SPSC Producer<br/>(Write index / Release)"]
+    MD_Writer["MD 行情寫入端<br/>SPSC Producer<br/>(Load read: Acquire / Store write: Release)"]
     MD_Net --> MD_Parser --> MD_Writer
 end
 subgraph ST_PROC ["Process 2: 策略模組 (Strategy Process)"]
     direction TB
-    ST_MD_Reader["Strategy 行情讀取端<br/>SPSC Consumer<br/>(Read index / Acquire)"]
-    ST_Exec_Reader["Strategy 回報讀取端<br/>SPSC Consumer<br/>(Read index / Acquire)"]
+    ST_MD_Reader["Strategy 行情讀取端<br/>SPSC Consumer<br/>(Load write: Acquire / Store read: Release)"]
+    ST_Exec_Reader["Strategy 回報讀取端<br/>SPSC Consumer<br/>(Load write: Acquire / Store read: Release)"]
     ST_Engine["策略決策引擎<br/>(Alpha Models & Risk Checks)"]
-    ST_Order_Writer["Strategy 訂單寫入端<br/>SPSC Producer<br/>(Write index / Release)"]
+    ST_Order_Writer["Strategy 訂單寫入端<br/>SPSC Producer<br/>(Load read: Acquire / Store write: Release)"]
     ST_MD_Reader --> ST_Engine
     ST_Exec_Reader --> ST_Engine
     ST_Engine --> ST_Order_Writer
 end
 subgraph OMS_PROC ["Process 3: 下單與 OMS 模組 (OMS Process)"]
     direction TB
-    OMS_Order_Reader["OMS 訂單讀取端<br/>SPSC Consumer<br/>(Read index / Acquire)"]
+    OMS_Order_Reader["OMS 訂單讀取端<br/>SPSC Consumer<br/>(Load write: Acquire / Store read: Release)"]
     OMS_Router["訂單路由器與編碼器<br/>(State Machine & Protocol Encoder)"]
-    OMS_Exec_Writer["OMS 回報寫入端<br/>SPSC Producer<br/>(Write index / Release)"]
+    OMS_Exec_Writer["OMS 回報寫入端<br/>SPSC Producer<br/>(Load read: Acquire / Store write: Release)"]
     OMS_Net["網路發送器<br/>(TCP / Binary Protocol)"]
     OMS_Order_Reader --> OMS_Router
     OMS_Router --> OMS_Net

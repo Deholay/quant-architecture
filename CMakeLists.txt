@@ -1,0 +1,28 @@
+cmake_minimum_required(VERSION 3.20)
+project(quant_ipc VERSION 0.1.0 LANGUAGES CXX)
+
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  message(FATAL_ERROR "quant_ipc targets Linux; on Windows build inside WSL.")
+endif()
+if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  message(FATAL_ERROR "quant_ipc requires GCC or Clang atomic builtins.")
+endif()
+
+add_library(quant_ipc src/shm_region.cpp)
+target_include_directories(quant_ipc PUBLIC include)
+target_compile_features(quant_ipc PUBLIC cxx_std_20)
+target_compile_options(quant_ipc PRIVATE -Wall -Wextra -Wpedantic -Werror)
+target_link_libraries(quant_ipc PUBLIC rt)
+
+add_executable(ipc_demo examples/ipc_demo.cpp)
+target_link_libraries(ipc_demo PRIVATE quant_ipc)
+target_compile_options(ipc_demo PRIVATE -Wall -Wextra -Wpedantic -Werror)
+
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(ipc_tests tests/ipc_tests.cpp)
+  target_link_libraries(ipc_tests PRIVATE quant_ipc)
+  target_compile_options(ipc_tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  add_test(NAME ipc_tests COMMAND ipc_tests)
+  set_tests_properties(ipc_tests PROPERTIES TIMEOUT 30)
+endif()
