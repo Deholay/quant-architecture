@@ -67,8 +67,9 @@ bash examples/run_demo.sh ./build-wsl/ipc_demo
 - 不覆寫未讀訊息；pop 失敗時保留輸出內容；不提供 live reset 或動態擴容。
 - Producer release 更新 write cursor，consumer acquire 讀取 write cursor；
   consumer release 更新 read cursor，producer acquire 讀取 read cursor。
-- 兩個 cursor 各占獨立 64-byte cache line。使用 GCC/Clang atomic builtins，
-  保留原生 lock-free 64-bit atomic 的編譯期檢查；不要宣稱這是純 ISO C++ 可攜 IPC。
+- 兩個 cursor 各占獨立 64-byte cache line。使用 C++20 `std::atomic_ref<std::uint64_t>`
+  存取 SHM 中的 plain cursor，保留原生 lock-free 與 required alignment 的編譯期檢查；
+  不要宣稱這是純 ISO C++ 可攜 IPC。
 - SHM 訊息使用固定布局，遵守現有 type traits；不得包含 process-local 指標或動態容器。
 - `ShmRegion`／`ShmQueue` 為 move-only；本地 handle 的生命週期必須涵蓋所有 queue 存取。
 - `create()` 使用 `O_CREAT | O_EXCL`，不得截斷既有物件；`open()` 不初始化或重設 queue。

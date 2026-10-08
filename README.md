@@ -7,7 +7,8 @@ MD、ST、OMS、交易訊息格式、交易復原與 supervisor 不在本階段�
 
 - Linux、C++20、GCC 或 Clang；Windows 請在 WSL 內建置。
 - 64-bit atomic 必須在目標平台原生 lock-free，否則編譯失敗。
-- 採用 GCC/Clang `__atomic` builtins，搭配 Linux coherent `MAP_SHARED` 映射。
+- 使用 C++20 `std::atomic_ref<std::uint64_t>` 存取 SHM 中的 plain cursor，搭配 Linux
+  coherent `MAP_SHARED` 映射；`atomic_ref` 本身只是在各 process 內短暫建立，不存入 SHM。
   這是明確限定平台的 IPC 實作，不宣稱純 ISO C++ 的跨 process 可攜性。
 - 所有參與者須使用相容的編譯器 ABI、型別配置、endianness 及本函式庫版本。
 - cache line 假設為 64 bytes；使用不同硬體時需重新評估對齊與效能。
@@ -35,7 +36,7 @@ header/schema/generation 驗證、初始化鎖、建立端初始化中異常退�
 | `ShmRegion` | 建立／開啟 SHM、設定大小、映射、RAII 解除映射；顯式 unlink |
 | `ShmManager` | 建構 typed queue，驗證 header、schema、generation；提供 remove |
 | `ShmQueue<T, N>` | 每個 process 自己持有的 move-only 映射 handle |
-| `SpscRing<T, N>` | SHM 中的兩個 cursor 與固定陣列；提供非阻塞 push/pop |
+| `SpscRing<T, N>` | SHM 中的兩個 cursor 與固定陣列；提供非阻塞 copy 與 direct-slot API |
 
 `ShmManager` 是共用工具類別，不是額外的常駐 process。
 建議未來由 launcher 呼叫 `create()`，MD／ST／OMS 呼叫 `open()`。
@@ -67,6 +68,25 @@ bool received = consumer.ring().try_pop(result);
 // 由生命週期擁有者協調停止所有參與者後，移除名稱。
 ShmManager::remove("/quant.session1.feed");
 ```
+
+若要避免把完整訊息從本地物件 assignment 到 ring，可在 callback 範圍內直接填寫 slot：
+
+```cpp
+bool queued_directly = producer.ring().try_write([](Message& slot) noexcept {
+    slot.sequence = 1;
+    slot.value = 456;
+});
+
+std::uint64_t received_value = 0;
+bool consumed_directly = consumer.ring().try_read(
+    [&received_value](const Message& slot) noexcept {
+        received_value = slot.value;
+    });
+```
+
+`try_write()` 在 callback 返回後才發布訊息；`try_read()` 在 callback 返回後才釋放 slot。
+callback 必須為 `noexcept`，不得重入同一 ring，也不得保存傳入的 reference。若 queue 滿／空，
+對應 callback 不會執行。Direct-slot API 不增加 shared metadata，也不改變 SHM layout。
 
 `schema` 與 `generation` 都必須非零：
 
@@ -104,6 +124,13 @@ wait "$consumer_pid"
   使用固定寬度整數與固定大小陣列；初始化所有會讀取的欄位。
 - `try_push()` 滿載回傳 false，既有訊息不受影響。
 - `try_pop()` 空佇列回傳 false，輸出參數保持不變。
+- `try_write()` 直接填寫未發布的 slot；滿載時回傳 false 且不呼叫 callback。
+- `try_read()` 在原 slot 上讀取；空佇列時回傳 false 且不呼叫 callback。
+- Direct-slot callback 必須 `noexcept`、同步完成、不可重入同一 ring，且 reference 不得逸出。
+- `try_write()` 的 callback 必須初始化 consumer 會讀取的所有欄位；重用的 slot 可能含舊值。
+- Producer callback 返回並 release 更新 write cursor 前，slot 尚未發布；consumer 本次讀取會放棄。
+- Consumer callback 返回並 release 更新 read cursor 前，該 slot 不可重用；producer 仍可寫其他空 slot。
+- 若其他端正好推進 cursor，本次操作仍可能保守地回傳 false；呼叫端可依自身政策稍後重試。
 - Producer release 寫入 write cursor；consumer acquire 讀取 write cursor。
 - Consumer release 寫入 read cursor；producer acquire 讀取 read cursor。
 - 兩個 cursor 各占獨立的 64-byte cache line。資料欄位不需要逐欄位 atomic。
@@ -136,4 +163,4 @@ unlink 不會使既有映射失效，因此不要在仍有參與者運行時移�
 
 - [Linux shm_open](https://man7.org/linux/man-pages/man3/shm_open.3.html)
 - [Linux flock](https://man7.org/linux/man-pages/man2/flock.2.html)
-- [GCC atomic builtins](https://gcc.gnu.org/onlinedocs/gcc/_005f_005fatomic-Builtins.html)
+- [C++ std::atomic_ref](https://en.cppreference.com/w/cpp/atomic/atomic_ref.html)

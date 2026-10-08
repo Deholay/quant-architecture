@@ -4,6 +4,7 @@
 #include <chrono>
 #include <csignal>
 #include <iostream>
+#include <latch>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -43,16 +44,175 @@ struct Packet {
     std::array<std::uint64_t, 7> payload;
 };
 
-Packet packet(std::uint64_t sequence) {
-    Packet p{sequence, {}};
+void fill_packet(Packet& p, std::uint64_t sequence) noexcept {
+    p.sequence = sequence;
     for (std::size_t j = 0; j < p.payload.size(); ++j)
         p.payload[j] = sequence * 13 + j;
+}
+
+Packet packet(std::uint64_t sequence) {
+    Packet p{};
+    fill_packet(p, sequence);
     return p;
 }
 
+bool packet_matches(const Packet& p, std::uint64_t sequence) noexcept {
+    if (p.sequence != sequence) return false;
+    for (std::size_t j = 0; j < p.payload.size(); ++j)
+        if (p.payload[j] != sequence * 13 + j) return false;
+    return true;
+}
+
 void check_packet(const Packet& p, std::uint64_t sequence) {
-    require(p.sequence == sequence && p.payload == packet(sequence).payload,
-            "FIFO order or payload integrity failure");
+    require(packet_matches(p, sequence), "FIFO order or payload integrity failure");
+}
+
+void direct_slot_access() {
+    SpscRing<Packet, 2> ring;
+    std::size_t read_calls = 0;
+    auto empty_reader = [&read_calls](const Packet&) noexcept { ++read_calls; };
+    require(!ring.try_read(empty_reader), "empty direct read must fail");
+    require(read_calls == 0, "empty direct read must not invoke callback");
+
+    const Packet expected = packet(7);
+    const Packet* written_slot = nullptr;
+    std::size_t write_calls = 0;
+    require(ring.try_write([&](Packet& slot) noexcept {
+        ++write_calls;
+        written_slot = &slot;
+        slot.sequence = expected.sequence;
+        for (std::size_t i = 0; i < slot.payload.size(); ++i)
+            slot.payload[i] = expected.payload[i];
+    }), "direct write");
+    require(write_calls == 1, "direct write callback count");
+
+    const Packet* read_slot = nullptr;
+    bool payload_matches = false;
+    require(ring.try_read([&](const Packet& slot) noexcept {
+        ++read_calls;
+        read_slot = &slot;
+        payload_matches = slot.sequence == expected.sequence &&
+                          slot.payload == expected.payload;
+    }), "direct read");
+    require(read_calls == 1, "direct read callback count");
+    require(written_slot == read_slot, "direct APIs must access the ring slot");
+    require(payload_matches, "direct read payload integrity");
+
+    const Packet eighth = packet(8);
+    const Packet ninth = packet(9);
+    require(ring.try_write([&](Packet& slot) noexcept { slot = eighth; }),
+            "first direct write into capacity");
+    require(ring.try_write([&](Packet& slot) noexcept { slot = ninth; }),
+            "second direct write into capacity");
+    bool full_writer_called = false;
+    require(!ring.try_write([&](Packet&) noexcept { full_writer_called = true; }),
+            "full direct write must fail");
+    require(!full_writer_called, "full direct write must not invoke callback");
+
+    Packet output{};
+    require(ring.try_pop(output), "direct write must interoperate with pop");
+    check_packet(output, 8);
+    require(ring.try_pop(output), "second direct write must interoperate with pop");
+    check_packet(output, 9);
+
+    const Packet tenth = packet(10);
+    require(ring.try_push(tenth), "push must interoperate with direct read");
+    payload_matches = false;
+    require(ring.try_read([&](const Packet& slot) noexcept {
+        payload_matches = slot.sequence == tenth.sequence && slot.payload == tenth.payload;
+    }), "direct read after push");
+    require(payload_matches, "push/direct read payload integrity");
+}
+
+void reader_gives_up_before_publish() {
+    SpscRing<Packet, 2> ring;
+    std::latch writer_entered{1};
+    std::latch allow_publish{1};
+    bool write_succeeded = false;
+
+    std::thread producer([&] {
+        write_succeeded = ring.try_write([&](Packet& slot) noexcept {
+            slot.sequence = 100;
+            slot.payload[0] = 100 * 13;
+            writer_entered.count_down();
+            allow_publish.wait();
+            for (std::size_t j = 1; j < slot.payload.size(); ++j)
+                slot.payload[j] = 100 * 13 + j;
+        });
+    });
+
+    writer_entered.wait();
+    bool reader_called = false;
+    const bool read_before_publish = ring.try_read(
+        [&](const Packet&) noexcept { reader_called = true; });
+    allow_publish.count_down();
+    producer.join();
+
+    require(write_succeeded, "paused direct write must eventually publish");
+    require(!read_before_publish, "reader must give up before producer publishes");
+    require(!reader_called, "reader callback must not see an unpublished slot");
+
+    bool payload_matches = false;
+    require(ring.try_read([&](const Packet& slot) noexcept {
+        payload_matches = packet_matches(slot, 100);
+    }), "reader must see slot after publish");
+    require(payload_matches, "reader saw a partially written slot");
+}
+
+void writer_uses_next_free_slot() {
+    SpscRing<Packet, 2> ring;
+    require(ring.try_write([](Packet& slot) noexcept { fill_packet(slot, 200); }),
+            "publish first slot");
+
+    std::latch consumer_entered{1};
+    std::latch allow_release{1};
+    std::latch first_released{1};
+    std::latch third_published{1};
+    bool first_read = false;
+    bool second_read = false;
+    bool third_read = false;
+    bool first_matches = false;
+    bool second_matches = false;
+    bool third_matches = false;
+
+    std::thread consumer([&] {
+        first_read = ring.try_read([&](const Packet& slot) noexcept {
+            first_matches = packet_matches(slot, 200);
+            consumer_entered.count_down();
+            allow_release.wait();
+        });
+        first_released.count_down();
+        third_published.wait();
+        second_read = ring.try_read([&](const Packet& slot) noexcept {
+            second_matches = packet_matches(slot, 201);
+        });
+        third_read = ring.try_read([&](const Packet& slot) noexcept {
+            third_matches = packet_matches(slot, 202);
+        });
+    });
+
+    consumer_entered.wait();
+    const bool wrote_next = ring.try_write(
+        [](Packet& slot) noexcept { fill_packet(slot, 201); });
+    bool full_writer_called = false;
+    const bool overwrote_held_slot = ring.try_write([&](Packet&) noexcept {
+        full_writer_called = true;
+    });
+
+    allow_release.count_down();
+    first_released.wait();
+    const bool reused_released_slot = ring.try_write(
+        [](Packet& slot) noexcept { fill_packet(slot, 202); });
+    third_published.count_down();
+    consumer.join();
+
+    require(first_read && first_matches, "consumer must read the held first slot");
+    require(wrote_next, "producer must be able to write the next free slot");
+    require(!overwrote_held_slot && !full_writer_called,
+            "producer must not overwrite a slot still held by consumer");
+    require(reused_released_slot, "producer must reuse slot after consumer release");
+    require(second_read && second_matches && third_read && third_matches,
+            "writer-next path must preserve FIFO and payload integrity");
 }
 
 void ring_boundaries() {
@@ -174,16 +334,21 @@ constexpr std::uint64_t transfer_count = 1000000;
 int consume(const char* name) {
     auto queue = ShmManager::open<Packet, 64>(name, 99, 1);
     const auto deadline = Clock::now() + std::chrono::seconds(15);
-    Packet output{};
     for (std::uint64_t i = 0; i < transfer_count; ++i) {
-        while (!queue.ring().try_pop(output)) {
+        bool payload_matches = false;
+        while (!queue.ring().try_read([&](const Packet& slot) noexcept {
+            payload_matches = slot.sequence == i;
+            for (std::size_t j = 0; j < slot.payload.size(); ++j)
+                payload_matches = payload_matches && slot.payload[j] == i * 13 + j;
+        })) {
             require(Clock::now() < deadline, "consumer timed out");
             std::this_thread::yield();
         }
-        check_packet(output, i);
+        require(payload_matches, "cross-process payload integrity failure");
         if (i % 10000 == 0) std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
-    require(!queue.ring().try_pop(output), "unexpected extra message");
+    require(!queue.ring().try_read([](const Packet&) noexcept {}),
+            "unexpected extra message");
     return 0;
 }
 
@@ -255,8 +420,11 @@ void cross_process() {
     Child child{pid};
     const auto deadline = Clock::now() + std::chrono::seconds(15);
     for (std::uint64_t i = 0; i < transfer_count; ++i) {
-        const auto input = packet(i);
-        while (!queue.ring().try_push(input)) {
+        while (!queue.ring().try_write([i](Packet& slot) noexcept {
+            slot.sequence = i;
+            for (std::size_t j = 0; j < slot.payload.size(); ++j)
+                slot.payload[j] = i * 13 + j;
+        })) {
             require(Clock::now() < deadline, "producer timed out");
             std::this_thread::yield();
         }
@@ -267,6 +435,9 @@ void cross_process() {
 int main(int argc, char** argv) {
     try {
         if (argc == 3 && std::string(argv[1]) == "--consume") return consume(argv[2]);
+        direct_slot_access();
+        reader_gives_up_before_publish();
+        writer_uses_next_free_slot();
         ring_boundaries();
         manager_lifecycle();
         region_lifecycle_and_failures();
