@@ -2,6 +2,7 @@
 
 本階段只實作 **POSIX SHM、SHM manager、SPSC ring buffer**。
 MD、ST、OMS、交易訊息格式、交易復原與 supervisor 不在本階段。
+另提供使用既有日檔的 tick 重播與 latency 量測範例，僅驗證 IPC 傳輸，不包含行情業務處理。
 
 ## 執行環境
 
@@ -113,6 +114,85 @@ wait "$consumer_pid"
 屬於呼叫端政策，`try_push()`／`try_pop()` 本身不等待。
 
 也可執行 `bash examples/run_demo.sh`，自動啟動兩端並在結束或失敗時清理範例 SHM。
+
+## 整日 Parquet tick 重播與 latency
+
+`tick_replay` 使用兩個獨立 C++ process，分別重新 attach SHM，逐筆傳送 tick。
+Queue 容量固定為 1024；滿時 producer 保留當前筆、有界重試，不跳筆、不覆寫。
+Consumer 驗證重播 sequence、所有 tick 欄位的 rolling checksum，最後核對 EOF 紀錄的筆數與 checksum。
+EOF 與空 queue 分開；producer 異常退出或少了 EOF 時，consumer 會 timeout，不回報成功。
+Checksum 用於偵測意外資料不一致，非密碼學完整性保證。
+
+來源是 `daily_parquet/twstock_YYYYMMDD.parquet` 格式：`symbol` 加上
+`examples/replay_fields.def` 所列的 37 個數值欄位。保留原始列順序、時間、sequence、
+成交資訊及五檔報價；不排序、不假設來源 sequence 連續、不換算價格或時間單位。
+Price 保留 IEEE 754 double。`symbol` 支援最多 15 個 UTF-8 bytes，超長、含 NUL、
+null 或欄位／型別不符均明確拒絕，不截斷或填補。
+
+先將 Parquet 分批轉成固定布局的小端序重播檔，再由 C++ producer 讀取。
+轉換工具需要 Python 3 與 PyArrow；C++ IPC 核心不依賴 Arrow。
+每批最多 16,384 筆，不一次載入整日資料。輸出檔已有內容時拒絕覆寫；
+中途失敗會清理臨時檔，不留下可誤認為完成的輸出檔。
+
+```bash
+cmake -S . -B build-wsl -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake --build build-wsl -j
+
+# 將來源路徑改成你的日檔；輸出目錄必須已存在。
+python3 examples/prepare_tick_replay.py /path/to/twstock_YYYYMMDD.parquet build-wsl/ticks.bin
+# 可加 --limit 100000 先驗證前十萬筆；省略代表全部資料。
+
+bash examples/run_tick_replay.sh build-wsl/ticks.bin ./build-wsl/tick_replay
+```
+
+重播檔含 32-byte header，每筆 312 bytes；一千五百萬筆約需 4.68 GB。
+此格式是範例用的固定 schema，不是交易協定。變更欄位布局時必須升級 file magic／schema，重新轉換。
+本範例限定 little-endian、64-bit IEEE 754 double 平台。
+
+Runner 需要 Bash 5.1 以上，建立獨立 SHM 名稱；兩端退出後才移除名稱，失敗時停止並回收另一端。
+也可手動啟動（自行負責停止、等待與清理）：
+
+```bash
+./build-wsl/tick_replay create /my.replay 1
+./build-wsl/tick_replay receive /my.replay 1 10000 &
+consumer_pid=$!
+./build-wsl/tick_replay send /my.replay 1 build-wsl/ticks.bin 10000
+wait "$consumer_pid"
+./build-wsl/tick_replay remove /my.replay
+```
+
+`10000` 是每次等待 queue 進展的 timeout（毫秒），不是整日重播時限。
+這個期限不會中斷作業系統內阻塞的檔案讀取。直接寫入 callback 裡的檔案 I/O 屬於範例呼叫端；
+ring 本身仍不配置記憶體、不做 syscall 或等待。
+Runner 第三、四個參數可指定 timeout 與 consumer 每筆處理後延後的微秒數：
+
+```bash
+# 建議搭配小型輸入，刻意產生背壓；每筆延後 100 us 並非精確節拍。
+bash examples/run_tick_replay.sh build-wsl/ticks.bin ./build-wsl/tick_replay 10000 100
+```
+
+完成後輸出兩種 latency（皆為 ns）：
+
+| 輸出 | 起點 → 終點 | 包含成本 |
+|---|---|---|
+| `enqueue_wait` | 首次嘗試寫入前 → 進入 writer callback | queue 滿時的重試、排程、一次成功入列檢查；不含讀檔 |
+| `queue_delivery` | tick 填妥、checksum 計算完、即將 publish → reader callback 一進入 | publish 前的少量指令、發布、排隊、跨核心可見性與 consumer 排程；不含 producer 讀檔與當筆 consumer checksum |
+
+兩端使用同一 Linux 的 `CLOCK_MONOTONIC`；不以歷史行情時間減現在時間。
+每筆都量測，以固定大小 histogram 彙整；`p50_upper_ns`、`p95_upper_ns`、`p99_upper_ns`
+是 nearest-rank 分位數所在桶的上界，桶寬約不超過 6.25%，不是精確分位數。
+`max_ns` 是精確樣本最大值，平均值使用累積和；空檔輸出 `latency_ns=n/a`。
+EOF 不列入 latency 樣本。Clock failure 或負的時間差會報錯。
+
+同時輸出 rows、checksum、`full_retries`／`empty_retries`、耗時及 ticks/sec。
+Retry 次數代表失敗嘗試次數，並非遺失筆數。Producer throughput 包含重播檔讀取、checksum、
+量測與背壓，**不包含 Parquet 轉換**；consumer wall throughput 另包含啟動後等待 producer 的時間。
+量測與統計本身有成本；全速重播容易填滿 queue，長尾包含排隊時間，不能解讀為純 atomic 指令延遲。
+目前是盡快送完模式，未加入依原始 timestamp 配速、CPU affinity 或無量測的對照 benchmark。
+
+CTest 保留原有百萬筆 `fork + exec` 測試，另加入 histogram 邊界與 checksum 測試。
+有 Python 3 時啟用獨立 process 重播整合測試；另有 PyArrow 時啟用完整欄位轉換與錯誤輸入測試。
+缺少工具時 CMake 會明確顯示略過的項目。
 
 ## SPSC 契約
 

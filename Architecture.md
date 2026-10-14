@@ -13,6 +13,10 @@
 SPSC 嚴格限定每條 queue 一個 producer thread 與一個 consumer thread。
 兩個索引各自占用獨立的 64-byte cache line；訊息陣列起點對齊 64 bytes。
 
+另有 `examples/tick_replay.cpp` 作為傳輸驗證範例：Parquet 日檔先分批轉成固定格式，
+producer 逐筆讀入 SHM，consumer 核對序號／checksum，並以 monotonic clock 統計傳遞延遲。
+此範例保留來源 tick 欄位，未實作 MD parser、order book 或策略；執行方式與量測定義見 README。
+
 # 三大模組
 * Process 1: **MD** 行情接收模組 (Market Data Process)
 * Process 2: **ST** 策略模組 (Strategy Process)
