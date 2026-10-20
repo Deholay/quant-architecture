@@ -9,17 +9,44 @@ input=$1
 binary=${2:-./build-wsl/tick_replay}
 timeout_ms=${3:-10000}
 delay_us=${4:-0}
+log_dir=${REPLAY_LOG_DIR:-"$(dirname -- "$binary")/logs"}
+mkdir -p -- "$log_dir"
+log_file=$(mktemp "$log_dir/replay-$(date +%Y%m%d-%H%M%S)-XXXXXX.log")
+
+# Keep signal handling in the runner; wait for tee after closing its input.
+exec 3>&1 4>&2
+exec > >(tee -i -- "$log_file") 2>&1
+log_pid=$!
 name="/quant.replay.$$.$RANDOM"
 created=0
 pids=()
 cleanup() {
+    status=$?
+    trap - EXIT
     for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
     for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
-    if (( created )); then "$binary" remove "$name"; fi
+    if (( created )); then
+        if ! "$binary" remove "$name"; then
+            if (( status == 0 )); then status=1; fi
+        fi
+    fi
+    printf 'finished=%s exit_status=%s\n' "$(date --iso-8601=seconds)" "$status"
+    exec 1>&3 2>&4 3>&- 4>&-
+    log_status=0
+    wait "$log_pid" || log_status=$?
+    if (( log_status != 0 )); then
+        printf 'Failed to save replay log: %s\n' "$log_file" >&2
+        if (( status == 0 )); then status=$log_status; fi
+    fi
+    exit "$status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+printf 'log_file=%s\n' "$log_file"
+printf 'started=%s\ninput=%s\nbinary=%s\nstall_timeout_ms=%s consumer_delay_us=%s\n' \
+    "$(date --iso-8601=seconds)" "$input" "$binary" "$timeout_ms" "$delay_us"
 
 "$binary" create "$name" 1
 created=1

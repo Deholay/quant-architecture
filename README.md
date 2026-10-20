@@ -150,6 +150,16 @@ bash examples/run_tick_replay.sh build-wsl/ticks.bin ./build-wsl/tick_replay
 本範例限定 little-endian、64-bit IEEE 754 double 平台。
 
 Runner 需要 Bash 5.1 以上，建立獨立 SHM 名稱；兩端退出後才移除名稱，失敗時停止並回收另一端。
+每次自動將 stdout／stderr 同時顯示在 terminal 並存成 `.log`，預設目錄是執行檔旁的 `logs/`，
+例如 `build-wsl/logs/replay-20261014-153000-Ab12Cd.log`。檔名含時間與隨機尾碼，不覆寫先前結果。
+Log 包含來源路徑、執行參數、開始／結束時間、兩端統計與退出碼；失敗訊息也會保存。
+腳本會等待 log 寫完再退出，保留重播失敗退出碼；若只有寫 log 失敗，也會回傳非零。
+可用環境變數指定 log 目錄（自動建立）：
+
+```bash
+REPLAY_LOG_DIR=./build-wsl/my-logs bash examples/run_tick_replay.sh build-wsl/ticks.bin ./build-wsl/tick_replay
+```
+
 也可手動啟動（自行負責停止、等待與清理）：
 
 ```bash

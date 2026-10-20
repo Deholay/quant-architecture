@@ -1,5 +1,6 @@
 """Independent executable endpoints; no inherited SHM mapping or third-party packages."""
 import importlib.util
+import os
 from pathlib import Path
 import re
 import struct
@@ -91,11 +92,27 @@ with tempfile.TemporaryDirectory(prefix="quant-replay-test-") as directory:
     # Exercise shell orchestration and its failure cleanup, with fast endpoint exits.
     fixture(path, 4)
     runner = ROOT / "examples/run_tick_replay.sh"
+    log_dir = directory / "replay logs"
+    runner_env = dict(os.environ, REPLAY_LOG_DIR=str(log_dir))
     result = subprocess.run(["bash", str(runner), str(path), BINARY, "1000"],
-                            capture_output=True, text=True, timeout=5)
+                            capture_output=True, text=True, timeout=5, env=runner_env)
     assert result.returncode == 0, (result.stdout, result.stderr)
+    logs = list(log_dir.glob("replay-*.log"))
+    assert len(logs) == 1, logs
+    success_log = logs[0].read_text()
+    assert success_log == result.stdout, (success_log, result.stdout)
+    assert "consumer rows=4 " in success_log and "verified=true" in success_log
+    assert "enqueue_wait samples=4" in success_log and "queue_delivery samples=4" in success_log
+    assert "exit_status=0" in success_log and f"input={path}" in success_log
     result = subprocess.run(["bash", str(runner), str(directory / "missing"), BINARY, "1000"],
-                            capture_output=True, text=True, timeout=5)
-    assert result.returncode != 0, result
+                            capture_output=True, text=True, timeout=5, env=runner_env)
+    assert result.returncode == 1, result
+    new_logs = set(log_dir.glob("replay-*.log")) - set(logs)
+    assert len(new_logs) == 1, new_logs
+    failure_log = new_logs.pop().read_text()
+    assert failure_log == result.stdout, (failure_log, result.stdout)
+    assert "replay input must be a regular file" in failure_log
+    assert "exit_status=1" in failure_log
+    assert logs[0].read_text() == success_log  # a second run never overwrites the first
 
-print("Replay integration: FIFO/checksum, empty file, backpressure, format errors, timeout and runner passed")
+print("Replay integration: FIFO/checksum, empty file, backpressure, format errors, timeout, runner and logs passed")
