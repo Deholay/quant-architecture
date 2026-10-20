@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if (( $# < 1 || $# > 4 )); then
-    echo "Usage: bash examples/run_tick_replay.sh ticks.bin [binary] [stall_timeout_ms] [consumer_delay_us]" >&2
+if (( $# < 1 || $# > 5 )); then
+    echo "Usage: bash examples/run_tick_replay.sh ticks.bin [binary] [stall_timeout_ms] [consumer_delay_us] [consumer_binary]" >&2
     exit 2
 fi
 input=$1
 binary=${2:-./build-wsl/tick_replay}
 timeout_ms=${3:-10000}
 delay_us=${4:-0}
+consumer_binary=${5:-$binary}
 log_dir=${REPLAY_LOG_DIR:-"$(dirname -- "$binary")/logs"}
 mkdir -p -- "$log_dir"
 log_file=$(mktemp "$log_dir/replay-$(date +%Y%m%d-%H%M%S)-XXXXXX.log")
@@ -47,10 +48,11 @@ trap 'exit 143' TERM
 printf 'log_file=%s\n' "$log_file"
 printf 'started=%s\ninput=%s\nbinary=%s\nstall_timeout_ms=%s consumer_delay_us=%s\n' \
     "$(date --iso-8601=seconds)" "$input" "$binary" "$timeout_ms" "$delay_us"
+printf 'consumer_binary=%s\n' "$consumer_binary"
 
 "$binary" create "$name" 1
 created=1
-"$binary" receive "$name" 1 "$timeout_ms" "$delay_us" &
+"$consumer_binary" receive "$name" 1 "$timeout_ms" "$delay_us" &
 pids+=("$!")
 "$binary" send "$name" 1 "$input" "$timeout_ms" &
 pids+=("$!")

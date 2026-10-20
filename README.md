@@ -1,7 +1,7 @@
 # Quant IPC 基礎元件
 
 本階段只實作 **POSIX SHM、SHM manager、SPSC ring buffer**。
-MD、ST、OMS、交易訊息格式、交易復原與 supervisor 不在本階段。
+MD、完整 ST／OMS、交易訊息格式、交易復原與 supervisor 不在本階段。
 另提供使用既有日檔的 tick 重播與 latency 量測範例，僅驗證 IPC 傳輸，不包含行情業務處理。
 
 ## 執行環境
@@ -203,6 +203,38 @@ Retry 次數代表失敗嘗試次數，並非遺失筆數。Producer throughput 
 CTest 保留原有百萬筆 `fork + exec` 測試，另加入 histogram 邊界與 checksum 測試。
 有 Python 3 時啟用獨立 process 重播整合測試；另有 PyArrow 時啟用完整欄位轉換與錯誤輸入測試。
 缺少工具時 CMake 會明確顯示略過的項目。
+
+## 簡單策略 consumer：確認讀到 SHM tick
+
+`strategy_consumer` 是獨立 C++ process，沿用重播的 `Record`、schema 與容量，
+重新 attach SHM，再於 `try_read()` callback 內直接讀 tick 並呼叫 `on_tick()`。
+callback 返回前 slot 不會被 producer 重用；不保存 SHM reference。
+僅前五筆的顯示欄位複製到本地，離開 callback 後格式化，完成時印出樣本與彙整。
+
+示範規則：成交價高於最佳買賣價中點為 `buy`，低於為 `sell`，相等為 `hold`。
+價格非有限值、成交價或買價非正、賣價低於買價，或最佳買賣量非正時為 `ignored`。
+逐筆獨立判斷，不混用不同 symbol 的前一筆價格；不解讀來源 status，也不判斷報價新鮮度。
+這只是讀取與訊號示範，沒有持倉、風控或下單。
+
+```bash
+# 先依上節轉換 ticks.bin；第五個參數用策略取代原本的 consumer。
+bash examples/run_tick_replay.sh build-wsl/ticks.bin ./build-wsl/tick_replay 10000 0 ./build-wsl/strategy_consumer
+```
+
+輸出包含前五筆的 symbol、來源 sequence、成交價、最佳買賣價與訊號，最後顯示
+`strategy rows=... checksum=... verified=true buy=... sell=... hold=... ignored=...`。
+所有 tick（含 ignored）都核對重播 sequence、rolling checksum 與 EOF；沒有 EOF 時 timeout 失敗。
+此模式沿用 runner 的 log 與清理流程，producer 仍輸出 enqueue latency，策略端不量測 queue latency。
+
+手動連接已完成初始化的 SHM：
+
+```bash
+./build-wsl/strategy_consumer receive /my.replay 1 10000
+```
+
+同一條 queue 只能選 `tick_replay receive` 或 `strategy_consumer receive` 其中一個。
+SPSC 是消費式讀取，兩個 consumer 不能同時接在同一條 queue 上；runner 結束後會移除自己建立的 SHM。
+新增的跨 process 整合測試涵蓋訊號分類、多 symbol、樣本、空檔、筆數／checksum、世代不符與缺少 EOF。
 
 ## SPSC 契約
 

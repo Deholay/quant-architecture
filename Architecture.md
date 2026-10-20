@@ -9,13 +9,18 @@
 | SpscRing | `include/quant/ipc/spsc_ring.hpp` | 共用 template；每個 SHM 各自持有索引與訊息陣列 |
 
 後續由 launcher 建立三個獨立 SHM，再讓 MD／ST／OMS 連接；manager 不參與逐筆傳輸。
-本階段尚未實作三大業務模組、MarketTick／OrderRequest／ExecutionReport、supervisor 或交易復原。
+本階段尚未實作完整三大業務模組、MarketTick／OrderRequest／ExecutionReport、supervisor 或交易復原。
 SPSC 嚴格限定每條 queue 一個 producer thread 與一個 consumer thread。
 兩個索引各自占用獨立的 64-byte cache line；訊息陣列起點對齊 64 bytes。
 
 另有 `examples/tick_replay.cpp` 作為傳輸驗證範例：Parquet 日檔先分批轉成固定格式，
 producer 逐筆讀入 SHM，consumer 核對序號／checksum，並以 monotonic clock 統計傳遞延遲。
 此範例保留來源 tick 欄位，未實作 MD parser、order book 或策略；執行方式與量測定義見 README。
+
+`examples/strategy_consumer.cpp` 可取代重播 consumer，在獨立 process 重新 attach 後，
+以 `try_read()` 直接讀 SHM tick，示範成交價相對最佳買賣價中點的 buy／sell／hold 訊號。
+此範例保留 sequence／checksum／EOF 驗證，僅提供訊號計數及少量樣本，不含持倉、風控或下單。
+同一條 SPSC 不可同時啟動兩個 consumer；執行方式見 README。
 
 # 三大模組
 * Process 1: **MD** 行情接收模組 (Market Data Process)

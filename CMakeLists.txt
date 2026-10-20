@@ -22,6 +22,10 @@ add_executable(tick_replay examples/tick_replay.cpp)
 target_link_libraries(tick_replay PRIVATE quant_ipc)
 target_compile_options(tick_replay PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
+add_executable(strategy_consumer examples/strategy_consumer.cpp)
+target_link_libraries(strategy_consumer PRIVATE quant_ipc)
+target_compile_options(strategy_consumer PRIVATE -Wall -Wextra -Wpedantic -Werror)
+
 include(CTest)
 if(BUILD_TESTING)
   find_package(Threads REQUIRED)
@@ -40,6 +44,10 @@ if(BUILD_TESTING)
     add_test(NAME replay_integration COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay_integration.py $<TARGET_FILE:tick_replay>)
     set_tests_properties(replay_integration PROPERTIES TIMEOUT 30)
+    add_test(NAME strategy_integration COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/strategy_integration.py
+      $<TARGET_FILE:tick_replay> $<TARGET_FILE:strategy_consumer>)
+    set_tests_properties(strategy_integration PROPERTIES TIMEOUT 30)
     execute_process(COMMAND ${Python3_EXECUTABLE} -c "import pyarrow"
       RESULT_VARIABLE PYARROW_IMPORT_RESULT OUTPUT_QUIET ERROR_QUIET)
     if(PYARROW_IMPORT_RESULT EQUAL 0)
