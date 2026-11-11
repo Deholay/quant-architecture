@@ -65,8 +65,12 @@ public:
         static_assert(offsetof(Layout, ring) == sizeof(detail::Header));
         return ShmQueue<T, N>(ShmRegion::create(name, sizeof(Layout), [=](void* p) {
             auto* layout = ::new (p) Layout{};
-            layout->header = {detail::magic, detail::abi_version, schema, generation,
+            layout->header = {0, detail::abi_version, schema, generation,
                               sizeof(T), alignof(T), N, sizeof(Layout)};
+            // Publish last: an opener that acquires the magic sees a fully
+            // initialized header and ring (required where no startup lock exists).
+            std::atomic_ref<std::uint64_t>(layout->header.magic)
+                .store(detail::magic, std::memory_order_release);
         }));
     }
 
@@ -77,6 +81,11 @@ public:
         using Layout = detail::Layout<T, N>;
         return ShmQueue<T, N>(ShmRegion::open(name, sizeof(Layout), [=](void* p) {
             // Validate fixed header before treating the mapping as a typed ring.
+            auto* shared = static_cast<detail::Header*>(p);
+            const auto published = std::atomic_ref<std::uint64_t>(shared->magic)
+                                       .load(std::memory_order_acquire);
+            if (published != detail::magic)
+                throw std::runtime_error("SHM header incomplete or not a quant IPC queue");
             detail::Header h{};
             std::memcpy(&h, p, sizeof(h));
             if (h.magic != detail::magic || h.abi != detail::abi_version ||

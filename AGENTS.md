@@ -3,21 +3,26 @@
 ## 語言與本階段範圍
 
 - 使用繁體中文與使用者溝通；程式識別字使用英文。
-- 本階段只處理 POSIX shared memory、SHM manager、SPSC ring buffer 及相關測試、範例、文件。
-- 未經使用者擴充範圍，不實作 MD、ST、OMS 業務邏輯、交易訊息、策略、券商連線或 supervisor。
+- 使用者已擴充範圍：目標為完成整個 MD／ST／OMS 系統，依步驟逐項實作。
+- 已完成 IPC 基礎層與交易訊息型別（`include/quant/msg/messages.hpp`）；
+  其餘模組（launcher、MD、ST、OMS、supervisor、券商連線）依使用者指定的順序進行。
 - 先閱讀 `README.md` 與 `Architecture.md`。架構圖描述的是完整目標，不代表所有模組都已實作。
 
-## WSL 開發環境
+## 開發環境（WSL／Linux 與 macOS）
 
-- 主要開發與執行環境為 WSL 2 Ubuntu／Linux，使用 Bash、C++20、CMake 3.20 以上、GCC 或 Clang。
-- 目前曾驗證的環境是 WSL Ubuntu 24.04、x86_64、GCC 13.3；其他環境需實際驗證。
+- 支援 WSL 2 Ubuntu／Linux 與 macOS，使用 Bash、C++20、CMake 3.20 以上、GCC 或 Clang。
+- 曾驗證：WSL Ubuntu 24.04、x86_64、GCC 13.3；macOS 26（Darwin 25）、arm64、Apple clang
+  （手動編譯執行全部 C++ 與 Python 整合測試，未經 CMake）。其他環境需實際驗證。
+- 平台差異只放在 `src/shm_region.cpp`：macOS 不支援 SHM `flock`、名稱上限 31 bytes、
+  `fstat` 大小進位到整頁。測試 SHM 名稱須維持 31 bytes 以內。
+- Shell 腳本需同時相容 GNU 與 BSD 工具，以及 macOS 內建 bash 3.2（不用 `wait -n`、`date --iso-8601`）。
 - 進入 WSL 工作目錄後，直接執行 Linux 指令，不再包 `wsl.exe` 或 PowerShell。
 - 如果工作仍由 Windows 端發起，使用 `wsl -d Ubuntu-24.04 -- ...` 呼叫 Linux 工具；
   複雜 Bash 流程優先放在腳本，避免跨 shell 展開 `$` 或破壞引號。
 - 使用 Linux toolchain，不以 MSVC、MinGW 或 Windows native build 替代 POSIX 測試。
 - 原始碼可放在 WSL 的 `~/src/quant-architecture`；以實際 checkout 根目錄為準，
   不將 Windows 使用者名稱或 `/mnt/c/...` 絕對路徑寫死在程式、CMake 或測試中。
-- 所有 IPC 測試參與者必須在同一 Linux 環境、可存取同一 SHM namespace。
+- 所有 IPC 測試參與者必須在同一主機、同一 OS 環境、可存取同一 SHM namespace。
 
 ## 搬移工作目錄注意事項
 
@@ -56,6 +61,8 @@ bash examples/run_demo.sh ./build-wsl/ipc_demo
 | `include/quant/ipc/shm_region.hpp`、`src/shm_region.cpp` | POSIX SHM 建立、開啟、映射與 RAII 資源管理 |
 | `include/quant/ipc/shm_manager.hpp` | typed queue 初始化、header 驗證與映射 handle |
 | `include/quant/ipc/spsc_ring.hpp` | 共用固定容量 SPSC template |
+| `include/quant/msg/messages.hpp` | 三條通道的交易訊息固定布局與 schema ID |
+| `tests/message_tests.cpp` | 訊息布局與 SHM 傳遞完整性測試 |
 | `tests/ipc_tests.cpp` | 邊界、生命週期與跨 process 測試 |
 | `examples/ipc_demo.cpp`、`examples/run_demo.sh` | 純 IPC 傳輸示範 |
 
@@ -73,7 +80,9 @@ bash examples/run_demo.sh ./build-wsl/ipc_demo
 - SHM 訊息使用固定布局，遵守現有 type traits；不得包含 process-local 指標或動態容器。
 - `ShmRegion`／`ShmQueue` 為 move-only；本地 handle 的生命週期必須涵蓋所有 queue 存取。
 - `create()` 使用 `O_CREAT | O_EXCL`，不得截斷既有物件；`open()` 不初始化或重設 queue。
-- 保留啟動階段的 `flock` 與顯式解鎖。映射可能保留 open file description，不能只依賴 close 釋放鎖。
+- `ShmManager::create()` 最後以 release store 發布 header magic，`open()` 以 acquire 讀取；
+  這是兩個平台共同的初始化發布機制。
+- Linux 保留啟動階段的 `flock` 與顯式解鎖。映射可能保留 open file description，不能只依賴 close 釋放鎖。
 - attach 前驗證大小，再驗證 magic、ABI、schema、generation、訊息大小／對齊、容量與 region 大小。
 - 更改共享布局時同步處理 ABI 版本與測試；訊息欄位語意變更需更新應用端 schema ID。
 - 解構只解除本地映射，不自動 unlink。名稱移除由生命週期擁有者顯式執行。

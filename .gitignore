@@ -1,2 +1,4 @@
 /build*/
 /daily_parquet/
+
+.DS_Store

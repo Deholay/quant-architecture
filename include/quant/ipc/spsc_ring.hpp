@@ -10,7 +10,7 @@
 
 namespace quant::ipc {
 
-// Platform contract: Linux, GCC/Clang, coherent shared mappings, native lock-free
+// Platform contract: Linux or macOS, GCC/Clang, coherent shared mappings, native lock-free
 // 64-bit atomics. This is intentionally not a portable ISO C++ IPC abstraction.
 inline constexpr std::size_t cache_line_size = 64;
 

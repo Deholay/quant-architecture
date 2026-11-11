@@ -2,6 +2,8 @@
 
 #include <array>
 #include <chrono>
+#include <climits>
+#include <cstdlib>
 #include <csignal>
 #include <iostream>
 #include <latch>
@@ -21,6 +23,8 @@
 using namespace quant::ipc;
 using Clock = std::chrono::steady_clock;
 
+std::string self_path; // absolute path of this binary, re-executed by cross_process()
+
 void require(bool ok, const char* message) {
     if (!ok) throw std::runtime_error(message);
 }
@@ -35,7 +39,7 @@ void throws(F&& action) {
 struct Name {
     std::string value;
     explicit Name(const char* suffix)
-        : value("/quant_ipc_test." + std::to_string(::getpid()) + "." + suffix) {}
+        : value("/qi." + std::to_string(::getpid()) + "." + suffix) {} // macOS: <= 31 bytes
     ~Name() { try { ShmManager::remove(value); } catch (...) {} }
 };
 
@@ -276,7 +280,10 @@ void region_lifecycle_and_failures() {
     auto reopened = ShmRegion::open(name.value, 64, [](void* p) {
         require(*static_cast<std::uint64_t*>(p) == 123, "destructor must not unlink");
     });
-    throws([&] { auto bad = ShmRegion::open(name.value, 128, [](void*) {}); });
+    // macOS reports page-rounded sizes, so differ by a full page; exact byte
+    // mismatches are caught by ShmManager's region_size header field.
+    const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+    throws([&] { auto bad = ShmRegion::open(name.value, 64 + page, [](void*) {}); });
     throws([] { auto bad = ShmRegion::create("bad/name", 64, [](void*) {}); });
     throws([] { auto bad = ShmRegion::create("/zero", 0, [](void*) {}); });
     throws([&] { auto bad = ShmManager::create<Packet, 8>(name.value, 0, 1); });
@@ -291,8 +298,11 @@ void initialization_and_header_validation() {
         struct stat info {};
         require(::fstat(fd, &info) == 0 && (info.st_mode & 0777) == 0600,
                 "private SHM permissions");
+#if defined(__linux__)
+        // Linux-only startup lock; macOS relies on header magic publication.
         require(::flock(fd, LOCK_EX) == 0, "hold initialization lock");
         throws([&] { auto busy = ShmManager::open<Packet, 8>(name.value, 42, 7); });
+#endif
         ::close(fd);
     }
     // Each header field must be checked independently, including same-size ABI errors.
@@ -414,7 +424,7 @@ void cross_process() {
     require(pid >= 0, "fork failed");
     if (pid == 0) {
         // exec discards inherited mappings: consumer must attach independently.
-        ::execl("/proc/self/exe", "ipc_tests", "--consume", name.value.c_str(), nullptr);
+        ::execl(self_path.c_str(), "ipc_tests", "--consume", name.value.c_str(), nullptr);
         ::_exit(127);
     }
     Child child{pid};
@@ -435,6 +445,9 @@ void cross_process() {
 int main(int argc, char** argv) {
     try {
         if (argc == 3 && std::string(argv[1]) == "--consume") return consume(argv[2]);
+        char resolved[PATH_MAX];
+        require(::realpath(argv[0], resolved) != nullptr, "resolve test binary path");
+        self_path = resolved;
         direct_slot_access();
         reader_gives_up_before_publish();
         writer_uses_next_free_slot();

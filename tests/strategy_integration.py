@@ -69,7 +69,7 @@ with tempfile.TemporaryDirectory(prefix='quant-strategy-test-') as directory:
             assert 'symbol=0050 source_sequence=1000 last=101 bid=99 ask=101 signal=buy' in result.stdout
             assert 'symbol=2330 source_sequence=1001 last=99 bid=99 ask=101 signal=sell' in result.stdout
 
-    name = '/quant.strategy.test.' + uuid.uuid4().hex
+    name = '/quant.st.' + uuid.uuid4().hex[:16]  # macOS SHM names: <= 31 bytes
     run(REPLAY, 'create', name, 1)
     try:
         run(STRATEGY, 'receive', name, 2, 20, ok=False)
@@ -81,6 +81,7 @@ with tempfile.TemporaryDirectory(prefix='quant-strategy-test-') as directory:
         assert 'timeout' in result.stderr and 'verified=true' not in result.stdout
     finally:
         run(REPLAY, 'remove', name)
-        assert not Path('/dev/shm', name[1:]).exists()
+        if Path('/dev/shm').is_dir():  # Linux exposes SHM names here; macOS does not
+            assert not Path('/dev/shm', name[1:]).exists()
 
 print('Strategy integration: direct SHM reads, signals, samples, FIFO/checksum, empty input, generation and missing EOF passed')

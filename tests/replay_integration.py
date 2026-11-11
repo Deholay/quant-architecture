@@ -34,7 +34,7 @@ def fixture(path, count):
 
 
 def paired(path, count, delay=0):
-    name = "/quant.replay.test." + uuid.uuid4().hex
+    name = "/quant.rp." + uuid.uuid4().hex[:16]  # macOS SHM names: <= 31 bytes
     run("create", name, 1)
     consumer = None
     try:
@@ -58,7 +58,8 @@ def paired(path, count, delay=0):
             consumer.kill()
             consumer.wait()
         run("remove", name)
-        assert not Path("/dev/shm", name[1:]).exists()
+        if Path("/dev/shm").is_dir():  # Linux exposes SHM names here; macOS does not
+            assert not Path("/dev/shm", name[1:]).exists()
 
 
 with tempfile.TemporaryDirectory(prefix="quant-replay-test-") as directory:
@@ -70,7 +71,7 @@ with tempfile.TemporaryDirectory(prefix="quant-replay-test-") as directory:
     paired(path, 4096)
     paired(path, 4096, delay=100)
 
-    name = "/quant.replay.test." + uuid.uuid4().hex
+    name = "/quant.rp." + uuid.uuid4().hex[:16]  # macOS SHM names: <= 31 bytes
     run("create", name, 1)
     try:
         run("receive", name, 2, 20, ok=False)  # wrong generation

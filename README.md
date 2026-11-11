@@ -1,22 +1,39 @@
 # Quant IPC 基礎元件
 
-本階段只實作 **POSIX SHM、SHM manager、SPSC ring buffer**。
-MD、完整 ST／OMS、交易訊息格式、交易復原與 supervisor 不在本階段。
+已實作 **POSIX SHM、SHM manager、SPSC ring buffer**，以及三條通道的交易訊息型別
+（`MarketTick`、`OrderRequest`、`ExecutionReport`）。
+MD、ST、OMS 業務邏輯、launcher、交易復原與 supervisor 尚未實作。
 另提供使用既有日檔的 tick 重播與 latency 量測範例，僅驗證 IPC 傳輸，不包含行情業務處理。
 
 ## 執行環境
 
-- Linux、C++20、GCC 或 Clang；Windows 請在 WSL 內建置。
+- Linux（含 WSL）或 macOS、C++20、GCC 或 Clang；Windows 請在 WSL 內建置。
 - 64-bit atomic 必須在目標平台原生 lock-free，否則編譯失敗。
-- 使用 C++20 `std::atomic_ref<std::uint64_t>` 存取 SHM 中的 plain cursor，搭配 Linux
+- 使用 C++20 `std::atomic_ref<std::uint64_t>` 存取 SHM 中的 plain cursor，搭配
   coherent `MAP_SHARED` 映射；`atomic_ref` 本身只是在各 process 內短暫建立，不存入 SHM。
   這是明確限定平台的 IPC 實作，不宣稱純 ISO C++ 的跨 process 可攜性。
 - 所有參與者須使用相容的編譯器 ABI、型別配置、endianness 及本函式庫版本。
 - cache line 假設為 64 bytes；使用不同硬體時需重新評估對齊與效能。
+  Apple Silicon 的 cache line 為 128 bytes（`sysctl hw.cachelinesize`）：功能正確，
+  但兩個 cursor 可能落在同一條 line，false-sharing 隔離較弱。
+
+### Linux 與 macOS 差異
+
+| 項目 | Linux／WSL | macOS |
+|---|---|---|
+| 初始化互斥 | `flock` 啟動鎖，加上 header magic 最後發布 | 不支援對 SHM 用 `flock`；只靠 header magic 以 release／acquire 發布 |
+| SHM 名稱長度 | 最多 255 bytes | 最多 31 bytes（含開頭 `/`） |
+| `fstat` 大小 | 精確位元組數 | 進位到整頁；精確大小由 header 的 `region_size` 驗證 |
+| 名稱可見位置 | `/dev/shm` | 無對應檔案系統路徑 |
+| 連結 | `librt` | 不需要 |
+
+兩個平台的差異集中在 `src/shm_region.cpp`；SHM 布局與 API 相同。
+跨平台共用 SHM 不適用：參與者必須在同一台主機、同一 OS。
+`run_tick_replay.sh` 可在 Linux bash 及 macOS 內建 bash 3.2 執行。
 
 ## 建置與測試
 
-在 Linux／WSL 的專案目錄執行：
+在 Linux／WSL 或 macOS 的專案目錄執行（macOS 可用 `brew install cmake` 安裝 CMake）：
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -27,7 +44,8 @@ ctest --test-dir build --output-on-failure
 測試涵蓋滿／空邊界、全部容量可用、FIFO、訊息完整性、環狀位置重用、
 uint64 計數器回繞、三條獨立通道、move 與解除映射、重複建立、初始化失敗、
 header/schema/generation 驗證、初始化鎖、建立端初始化中異常退出、發布後 producer 退出，
-以及一百萬筆跨 process 傳遞。
+以及一百萬筆跨 process 傳遞。`message_tests` 驗證三種交易訊息的固定布局、
+經 SHM 傳遞後的欄位完整性，以及 schema ID 不符時拒絕 attach。
 跨 process 測試使用 `fork + exec`，消費者必須重新開啟映射，不能依賴繼承的位址。
 
 ## 元件責任
@@ -236,6 +254,36 @@ bash examples/run_tick_replay.sh build-wsl/ticks.bin ./build-wsl/tick_replay 100
 SPSC 是消費式讀取，兩個 consumer 不能同時接在同一條 queue 上；runner 結束後會移除自己建立的 SHM。
 新增的跨 process 整合測試涵蓋訊號分類、多 symbol、樣本、空檔、筆數／checksum、世代不符與缺少 EOF。
 
+## 交易訊息型別
+
+定義於 `include/quant/msg/messages.hpp`（namespace `quant::msg`），header-only：
+
+| 通道 | 方向 | 型別 | 大小 | schema 常數 |
+|---|---|---|---|---|
+| Feed Queue | MD → ST | `MarketTick` | 256 B | `market_tick_schema` |
+| Order Queue | ST → OMS | `OrderRequest` | 64 B | `order_request_schema` |
+| Execution Report Queue | OMS → ST | `ExecutionReport` | 128 B | `execution_report_schema` |
+
+```cpp
+#include "quant/msg/messages.hpp"
+using namespace quant::msg;
+auto feed = ShmManager::create<MarketTick, 1024>("/feed", market_tick_schema, generation);
+```
+
+- 三個型別皆 `alignas(64)`、trivially copyable、standard layout，大小為 64 的倍數；
+  布局與關鍵 offset 由 `static_assert` 固定。
+- 價格為定點整數 `Price`（`int64`），實際價格 = `Price / price_scale`（10,000）；數量為 `int64`。
+- 商品以 `SymbolId`（`uint32`）識別，不在訊息內放字串。
+- `MarketTick` 帶 5 檔買賣簿（最佳價在前），`flags` 為 `tick_flag::trade／snapshot／halted` 位元組合。
+- `OrderRequest` 以 `action` 區分新單／刪單／改單；每筆請求使用新的 `client_order_id`，
+  刪改單以 `target_order_id` 指向仍有效的委託。
+- `ExecutionReport` 以 `exec_type` 表示接受、拒絕、部分成交、全部成交、刪單、改單、
+  刪改失敗與到期；拒絕原因放在 `reject_reason`。
+- 時間欄位：`exchange_ns`／`transact_time_ns` 為交易所 UTC epoch 奈秒；
+  `*_local_ns` 為本機 `CLOCK_MONOTONIC` 奈秒，同一主機的三個 process 可直接比較。
+- 改變任一欄位的布局或語意時，必須遞增該型別的 schema 常數。
+- 此格式是本機 IPC 的內部格式，不是交易所協定，也未定義跨主機 endianness。
+
 ## SPSC 契約
 
 - 每條 queue 嚴格限一個 producer thread、一個 consumer thread；API 不會替你註冊或鎖定角色。
@@ -264,8 +312,11 @@ SPSC 是消費式讀取，兩個 consumer 不能同時接在同一條 queue 上�
 `create()` 使用 `O_CREAT | O_EXCL`，既有名稱會失敗，不會截斷或清空既有 SHM。
 預設權限為 `0600`（仍受 umask 影響），適合同一使用者的多個 process。
 
-建立端在初始化期間持有 Linux `flock` exclusive lock；開啟端使用 nonblocking shared lock，
-並先驗證檔案大小，再驗證固定 header。鎖只用於初始化，不在 push/pop 熱路徑。
+`ShmManager::create()` 先寫好 ring 與 header 其他欄位，最後以 release store 寫入 magic；
+`open()` 先以 acquire load 讀 magic，成功才讀其餘 header。兩個平台都依賴這個發布順序。
+Linux 另外在初始化期間持有 `flock` exclusive lock，開啟端使用 nonblocking shared lock；
+macOS 不支援對 SHM 使用 `flock`，因此不加鎖。鎖只用於初始化，不在 push/pop 熱路徑。
+開啟端先驗證大小（macOS 為整頁粒度），再驗證固定 header。
 若開啟得太早，會得到 lock busy、大小或 header 不符的例外；呼叫端應完成啟動握手後再連接。
 不能把「名稱存在」當成「初始化完成」。
 

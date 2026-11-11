@@ -14,11 +14,25 @@
 
 namespace quant::ipc {
 namespace {
+// Platform differences, kept in this file only:
+//  - Linux supports flock on SHM descriptors; it guards startup. macOS does not,
+//    so there startup relies on ShmManager publishing the header magic last.
+//  - macOS rounds the object size to whole pages and limits names to 31 bytes.
+#if defined(__linux__)
+constexpr bool startup_lock = true;
+constexpr std::size_t max_name_bytes = 255;
+#elif defined(__APPLE__)
+constexpr bool startup_lock = false;
+constexpr std::size_t max_name_bytes = 31; // PSHMNAMLEN, including leading '/'
+#else
+#error "quant_ipc supports Linux and macOS only"
+#endif
+
 void validate_name(const std::string& name) {
-    if (name.size() < 2 || name.size() > 255 || name.front() != '/' ||
+    if (name.size() < 2 || name.size() > max_name_bytes || name.front() != '/' ||
         name.find('/', 1) != std::string::npos ||
         name.find('\0') != std::string::npos)
-        throw std::invalid_argument("SHM name must be /name, at most 255 bytes");
+        throw std::invalid_argument("SHM name must be /name within the platform length limit");
 }
 
 void validate_size(std::size_t bytes) {
@@ -30,19 +44,31 @@ void validate_size(std::size_t bytes) {
     throw std::system_error(errno, std::generic_category(), operation);
 }
 
+// Size reported by fstat for an object truncated to `bytes`.
+off_t object_size(std::size_t bytes) {
+#if defined(__APPLE__)
+    const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+    if (bytes > std::numeric_limits<std::size_t>::max() - page) throw std::invalid_argument("invalid SHM size");
+    bytes = (bytes + page - 1) / page * page;
+#endif
+    return static_cast<off_t>(bytes);
+}
+
 struct Fd {
     int value;
     ~Fd() {
         if (value >= 0) {
             // mmap can retain the open file description after close(fd).
             // Release the startup lock explicitly before closing the descriptor.
-            while (::flock(value, LOCK_UN) != 0 && errno == EINTR) {}
+            if constexpr (startup_lock)
+                while (::flock(value, LOCK_UN) != 0 && errno == EINTR) {}
             ::close(value);
         }
     }
 };
 
 void lock(int fd, int operation) {
+    if constexpr (!startup_lock) return;
     while (::flock(fd, operation) != 0) {
         if (errno != EINTR) fail("flock");
     }
@@ -81,7 +107,7 @@ ShmRegion ShmRegion::open(const std::string& name, std::size_t expected_bytes,
     lock(fd.value, LOCK_SH | LOCK_NB);
     struct stat info {};
     if (::fstat(fd.value, &info) != 0) fail("fstat");
-    if (info.st_size != static_cast<off_t>(expected_bytes))
+    if (info.st_size != object_size(expected_bytes))
         throw std::runtime_error("SHM size mismatch or initialization incomplete");
     void* address = ::mmap(nullptr, expected_bytes, PROT_READ | PROT_WRITE,
                            MAP_SHARED, fd.value, 0);
